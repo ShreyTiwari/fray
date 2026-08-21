@@ -6,6 +6,7 @@ import com.github.ajalt.clikt.parameters.groups.defaultByName
 import com.github.ajalt.clikt.parameters.groups.groupChoice
 import com.github.ajalt.clikt.parameters.options.*
 import com.github.ajalt.clikt.parameters.types.choice
+import com.github.ajalt.clikt.parameters.types.double
 import com.github.ajalt.clikt.parameters.types.file
 import com.github.ajalt.clikt.parameters.types.int
 import com.github.ajalt.clikt.parameters.types.long
@@ -30,12 +31,23 @@ import kotlinx.serialization.modules.subclass
 import org.pastalab.fray.core.ThreadContext
 import org.pastalab.fray.core.concurrency.operations.RacingOperation
 import org.pastalab.fray.core.debugger.DebuggerRegistry
+import org.pastalab.fray.core.feedback.FeedbackAggregator
+import org.pastalab.fray.core.feedback.FeedbackSource
+import org.pastalab.fray.core.feedback.IterationFeedback
+import org.pastalab.fray.core.feedback.IterationResult
+import org.pastalab.fray.core.feedback.NoveltyValuation
+import org.pastalab.fray.core.feedback.sources.ArtifactFeedbackSource
+import org.pastalab.fray.core.feedback.sources.CodeLocationFeedbackSource
+import org.pastalab.fray.core.feedback.sources.HandoffFeedbackSource
+import org.pastalab.fray.core.feedback.sources.StateFeedbackSource
 import org.pastalab.fray.core.logger.FrayLogger
 import org.pastalab.fray.core.observers.AntithesisErrorReporter
 import org.pastalab.fray.core.observers.ResourceOrderingCoverage
 import org.pastalab.fray.core.observers.ScheduleRecorder
 import org.pastalab.fray.core.observers.ScheduleRecording
 import org.pastalab.fray.core.observers.ScheduleVerifier
+import org.pastalab.fray.core.observers.ResourceIdentityLogger
+import org.pastalab.fray.core.observers.ThreadIdentityLogger
 import org.pastalab.fray.core.observers.ThreadOrderingCoverage
 import org.pastalab.fray.core.observers.ThreadPausingTimeLogger
 import org.pastalab.fray.core.observers.TimelineCoverage
@@ -46,6 +58,12 @@ import org.pastalab.fray.core.randomness.Randomness
 import org.pastalab.fray.core.randomness.RandomnessProvider
 import org.pastalab.fray.core.randomness.RecordedRandomProvider
 import org.pastalab.fray.core.scheduler.*
+import org.pastalab.fray.core.scheduler.genetic.GeneticConfig
+import org.pastalab.fray.core.scheduler.genetic.Population
+import org.pastalab.fray.core.scheduler.qlearning.LastObservedStateHolder
+import org.pastalab.fray.core.scheduler.qlearning.QLearningConfig
+import org.pastalab.fray.core.scheduler.qlearning.QTable
+import org.pastalab.fray.core.scheduler.qlearning.StateAbstraction
 import org.pastalab.fray.rmi.Constant.FRAY_DEBUGGER_DEBUG
 import org.pastalab.fray.rmi.Constant.FRAY_DEBUGGER_DISABLED
 import org.pastalab.fray.rmi.Constant.FRAY_DEBUGGER_MCP
@@ -274,6 +292,38 @@ class Fest : ScheduleAlgorithm("fest", false) {
   }
 }
 
+class Genetic : ScheduleAlgorithm("genetic", false) {
+  // Nullable so an unpassed flag (null) falls back to the fray.genetic.* base, then GeneticConfig.DEFAULT.
+  private val tournamentSize by option("--genetic-tournament-size").int()
+  private val mutationRate by option("--genetic-mutation-rate").double()
+  private val genomeLength by option("--genetic-genome-length").int()
+  private val geneBound by option("--genetic-gene-bound").int()
+  private val seedPopulation by option("--genetic-seed-population").int()
+  private val populationCap by option("--genetic-population-cap").int()
+  // Consecutive non-novel iterations before a restart; 0 disables.
+  private val restartStagnation by option("--genetic-restart-stagnation").int()
+
+  override fun getScheduler(randomness: Randomness): Scheduler {
+    // System-property base so CLI and JUnit share one resolution path; overlay passed flags, then clamp.
+    val base = GeneticConfig.fromSystemProperties()
+    val config =
+        base.copy(
+                tournamentSize = tournamentSize ?: base.tournamentSize,
+                mutationRate = mutationRate ?: base.mutationRate,
+                genomeLength = genomeLength ?: base.genomeLength,
+                geneBound = geneBound ?: base.geneBound,
+                seedPopulation = seedPopulation ?: base.seedPopulation,
+                populationCap = populationCap ?: base.populationCap,
+                restartStagnation = restartStagnation ?: base.restartStagnation,
+            )
+            .sanitized()
+    return GeneticScheduler(mutableListOf(), randomness).also {
+      it.config = config
+      it.population = Population(config.populationCap)
+    }
+  }
+}
+
 class Dynamic : ScheduleAlgorithm("dynamic", false) {
   val schedulerName by option("--scheduler-name")
 
@@ -282,6 +332,60 @@ class Dynamic : ScheduleAlgorithm("dynamic", false) {
     val scheduler =
         clazz.getConstructor(Randomness::class.java).newInstance(randomness) as Scheduler
     return scheduler
+  }
+}
+
+class QLearning : ScheduleAlgorithm("qlearning", false) {
+  // Nullable so an unpassed flag (null) falls back to the fray.qlearning.* base, then QLearningConfig.DEFAULT.
+  private val alpha by option("--qlearning-alpha").double()
+  private val gamma by option("--qlearning-gamma").double()
+  private val eps0 by option("--qlearning-eps0").double()
+  private val epsDecay by option("--qlearning-eps-decay").double()
+  private val epsMin by option("--qlearning-eps-min").double()
+  private val optimisticInit by option("--qlearning-optimistic-init").double()
+  private val tableCap by option("--qlearning-table-cap").int()
+  private val nStep by option("--qlearning-n-step").int()
+  private val stateMode by option("--qlearning-state-mode")
+  private val stateClass by option("--qlearning-state-class")
+  private val rewardBug by option("--qlearning-reward-bug").double()
+  private val rewardNovelty by option("--qlearning-reward-novelty").double()
+  private val rewardFitness by option("--qlearning-reward-fitness").double()
+
+  override fun getScheduler(randomness: Randomness): Scheduler {
+    // System-property base so CLI and JUnit share one resolution path; overlay passed flags, then clamp.
+    val base = QLearningConfig.fromSystemProperties()
+    val config =
+        base.copy(
+                alpha = alpha ?: base.alpha,
+                gamma = gamma ?: base.gamma,
+                eps0 = eps0 ?: base.eps0,
+                epsDecay = epsDecay ?: base.epsDecay,
+                epsMin = epsMin ?: base.epsMin,
+                optimisticInit = optimisticInit ?: base.optimisticInit,
+                tableCap = tableCap ?: base.tableCap,
+                nStep = nStep ?: base.nStep,
+                stateMode = stateMode ?: base.stateMode,
+                stateClass = stateClass ?: base.stateClass,
+                rewardBug = rewardBug ?: base.rewardBug,
+                rewardNovelty = rewardNovelty ?: base.rewardNovelty,
+                rewardFitness = rewardFitness ?: base.rewardFitness,
+            )
+            .sanitized()
+    // location mode reads RacingOperation.stackTraceHash, which is 0 unless resolution is forced on.
+    if (StateAbstraction.resolveMode(config.stateMode) == QLearningConfig.MODE_LOCATION) {
+      RacingOperation.resolveRacingOperationStackTraceHash = true
+    }
+    // policyRand is deliberately left at its own ControlledRandom(): sharing [randomness] would put
+    // policy draws on the runtime's recorded stream, and replay decodes the trace without drawing,
+    // so the runtime's draws would read the wrong positions back. See QLearningScheduler.policyRand.
+    return QLearningScheduler(mutableListOf(), randomness).also {
+      it.config = config
+      it.qTable = QTable(config)
+      it.epsilon = config.eps0
+      // observedStateHolder is injected Configuration-side later, so observedState mode resolves
+      // lazily via the provider closure inside refreshAbstraction.
+      it.refreshAbstraction()
+    }
   }
 }
 
@@ -314,6 +418,8 @@ class MainCommand : CliktCommand() {
               "pct" to PCT(),
               "surw" to SURW(),
               "fest" to Fest(),
+              "genetic" to Genetic(),
+              "qlearning" to QLearning(),
               "dynamic" to Dynamic(),
               "replay-from-recordings" to ReplayFromRecordings(),
               "replay" to Replay(),
@@ -432,13 +538,52 @@ class MainCommand : CliktCommand() {
           else -> null
         }
 
+  val feedback by
+      option(
+          "--feedback",
+          help =
+              "Comma-separated grey-box feedback sources for coverage-guided schedulers (e.g. " +
+                  "genetic). When set, this is the COMPLETE list of sources. Kinds: " +
+                  "'state[:target=N]', 'artifact:path=/p', 'handoff', 'location', 'none'. " +
+                  "Examples: 'state' (value feedback); 'artifact:path=/tmp/x' (pull-at-end file " +
+                  "hashing); 'handoff' (resource handoffs between threads); 'location' " +
+                  "(concurrency code-site coverage); 'none'. If omitted, no feedback sources are " +
+                  "registered. Each source may also carry ';'-separated C5 novelty-valuation " +
+                  "knobs: 'decay=linear|log|sqrt|satexp' (saturation curve; LOG once any knob is " +
+                  "given, else linear/pre-C5), 'weight=W' (>0; mostly affects reported fitness -- " +
+                  "see feedback/README.md §11), 'k=K' (satexp knee). The during-run sources " +
+                  "(state/handoff/location) use AFL-style hit-count bucketing (count, not just " +
+                  "presence) by default; pass 'hits=false' to opt out to plain set membership. E.g. " +
+                  "'location:decay=log', 'state:target=4999;weight=2;decay=log', 'handoff:hits=false'.",
+      )
+
+  val measure by
+      option(
+          "--measure",
+          help =
+              "Comma-separated feedback sources to COLLECT FOR REPORTING ONLY, using the same source " +
+                  "grammar as --feedback (e.g. 'handoff,location' or 'location:hits=false'). These are " +
+                  "measured every iteration and appear in the -Dfray.feedback.debug 'globalBySource' " +
+                  "trace (so they can be plotted), but they are NOT used as search feedback: a " +
+                  "coverage-guided scheduler (e.g. genetic) does not rank or restart on them. This " +
+                  "decouples what to MEASURE from what to USE AS FEEDBACK -- e.g. '--feedback state " +
+                  "--measure handoff,location' searches on state alone while still plotting all three " +
+                  "coverages. A source named in BOTH --feedback and --measure stays a search objective " +
+                  "(--feedback wins). C5 valuation knobs on a --measure entry are ignored (they only " +
+                  "shape objectives).",
+      )
+
   override fun run() {}
 
   fun toConfiguration(): Configuration {
+    // Set before constructing Configuration so init{} sees these on both the CLI and any in-JVM caller.
+    feedback?.let { System.setProperty("fray.feedback", it) }
+    measure?.let { System.setProperty("fray.measure", it) }
     val executionInfo =
         runConfig.getExecutionInfo(ignoreUnhandledExceptions, interleaveMemoryOps, maxScheduledStep)
     val randomnessProvider = randomnessProvider.getRandomnessProvider()
-    val resolveStackTraceHash = scheduler is SURW
+    val resolveStackTraceHash =
+        scheduler is SURW || timelineCoverageType == TimelineCoverageType.THREAD_ORDERING
     val configuration =
         Configuration(
             executionInfo,
@@ -507,9 +652,67 @@ data class Configuration(
           // Fest is feedback-guided and is meaningless without coverage: if none was specified,
           // fall back to the default measurement so it still has a signal to steer by.
           ?: if (scheduler is FestScheduler) ResourceOrderingCoverage() else null
+  // Grey-box feedback sources; some are also schedule/test-status observers. Runtime-only: never
+  // serialised, plays no part in replay.
+  val feedbackSources = mutableListOf<FeedbackSource>()
+  // Per-source novelty valuation keyed by source name; a source absent here uses NoveltyValuation.IDENTITY.
+  val feedbackValuations = mutableMapOf<String, NoveltyValuation>()
+  // Sources collected and reported but excluded from the search (no objective, no novelty contribution).
+  val measurementOnlySources = mutableSetOf<String>()
+  var feedbackAggregator: FeedbackAggregator? = null
+  // Feedback from the just-finished iteration, cached here (not passed ad-hoc) so the CLI and JUnit
+  // drivers, which evolve the scheduler at different moments, can't drift apart.
+  var lastFeedback: IterationFeedback = IterationFeedback.EMPTY
+  // Decision-time bridge for the Q-learning observedState abstraction; only ever read by a live
+  // QLearningScheduler. Long-lived (one per run) so the per-iteration scheduler swap can't strand it.
+  val lastObservedState = LastObservedStateHolder()
+  val feedbackDebug = System.getProperty("fray.feedback.debug", "false").toBoolean()
   var nextSavedIndex = 0
   var currentIteration = 0
   val startTime = TimeSource.Monotonic.markNow()
+
+  /** Build the aggregator once, after all sources are registered. No-op if already built. */
+  fun initFeedback() {
+    if (feedbackAggregator == null) {
+      feedbackAggregator =
+          FeedbackAggregator(
+              feedbackSources.toList(), feedbackValuations.toMap(), measurementOnlySources.toSet())
+    }
+  }
+
+  fun beforeIterationFeedback() {
+    feedbackAggregator?.beforeIteration(currentIteration)
+  }
+
+  /** Collect feedback at the iteration-end seam and cache it for the next nextIteration(). */
+  fun collectFeedback(bugFound: Throwable?) {
+    val aggregator = feedbackAggregator ?: return
+    val result = IterationResult(currentIteration, bugFound, report)
+    lastFeedback = aggregator.aggregate(result)
+    if (feedbackDebug) {
+      val perSource =
+          lastFeedback.signals.joinToString(", ") { "${it.sourceName}=${it.features.size}" }
+      frayLogger.info(
+          "[feedback] iter=$currentIteration objectives=${lastFeedback.objectives} " +
+              "fitness=${lastFeedback.fitness} novel=${lastFeedback.isNovel} " +
+              "newFeatures=${lastFeedback.newFeatures.size} thisRunBySource=[$perSource] " +
+              "globalDistinct=${aggregator.totalFeaturesSeen()} " +
+              "globalBySource=${aggregator.featuresSeenBySource()}",
+          true,
+      )
+    }
+  }
+
+  /**
+   * Fan a program-reported state value out to any registered [StateFeedbackSource]. Never throws --
+   * feedback is best-effort and must not disturb the program under test.
+   */
+  fun observeState(value: Long) {
+    // Publish the latest observed value for the Q-learning observedState abstraction before the
+    // reward-side fan-out.
+    lastObservedState.value = value
+    feedbackSources.forEach { if (it is StateFeedbackSource) runCatching { it.observe(value) } }
+  }
 
   fun saveToReportFolder(index: Int): Path {
     val path =
@@ -543,6 +746,16 @@ data class Configuration(
       testStatusObservers.add(scheduleRecorder)
       scheduleObservers.add(scheduleRecorder)
     }
+    System.getProperty("fray.threadIdLog")?.let { logPath ->
+      val threadIdentityLogger = ThreadIdentityLogger(Path.of(logPath))
+      scheduleObservers.add(threadIdentityLogger)
+      testStatusObservers.add(threadIdentityLogger)
+    }
+    System.getProperty("fray.resourceIdLog")?.let { logPath ->
+      val resourceIdentityLogger = ResourceIdentityLogger(Path.of(logPath))
+      scheduleObservers.add(resourceIdentityLogger)
+      testStatusObservers.add(resourceIdentityLogger)
+    }
     if (System.getProperty("fray.logPausingTime", "false").toBoolean()) {
       scheduleObservers.add(ThreadPausingTimeLogger(frayLogger))
     }
@@ -573,7 +786,133 @@ data class Configuration(
             1
           }
     }
+
+    // `fray.feedback` (set by --feedback, or directly under JUnit) is the complete list of sources
+    // driving a coverage-guided scheduler. Unset means no sources registered.
+    val feedbackSpec = System.getProperty("fray.feedback")
+    if (feedbackSpec != null) {
+      registerFeedbackSpec(feedbackSpec)
+    }
+    // `--measure` / `fray.measure`: same grammar, but the newly-added sources are marked
+    // measurement-only. Registered AFTER --feedback so a source named in both stays a search
+    // objective (registerFeedbackSpec dedups, so it isn't re-added or marked here).
+    val measureSpec = System.getProperty("fray.measure")
+    if (measureSpec != null) {
+      val before = feedbackSources.map { it.name }.toSet()
+      registerFeedbackSpec(measureSpec)
+      feedbackSources.forEach { if (it.name !in before) measurementOnlySources.add(it.name) }
+    }
+    if (feedbackSources.isNotEmpty()) {
+      initFeedback()
+    }
+
+    injectObservedStateHolder()
   }
+
+  /**
+   * Parse a `fray.feedback` spec ("source[:k=v[,k=v]][,source...]") and register the named sources.
+   * Unknown kinds are ignored; an explicit "none" registers nothing. Observer-sources are also added
+   * to the observer lists.
+   */
+  private fun registerFeedbackSpec(spec: String) {
+    if (spec.isBlank()) return
+    spec.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { entry ->
+      val kind = entry.substringBefore(":").trim()
+      val params =
+          entry
+              .substringAfter(":", "")
+              .split(";")
+              .mapNotNull { p ->
+                val kv = p.split("=", limit = 2)
+                if (kv.size == 2) kv[0].trim() to kv[1].trim() else null
+              }
+              .toMap()
+      when (kind) {
+        "none" -> {}
+        "state" -> {
+          if (feedbackSources.none { it is StateFeedbackSource }) {
+            feedbackSources.add(
+                StateFeedbackSource(
+                    target = params["target"]?.toLongOrNull(),
+                    countHits = parseHits(params),
+                ))
+            recordValuation("state", params)
+          }
+        }
+        "artifact" -> {
+          val path = params["path"] ?: entry.substringAfter(":", "").substringBefore(";").trim()
+          if (path.isNotEmpty()) {
+            val artifact = ArtifactFeedbackSource(artifactPath = Path.of(path))
+            feedbackSources.add(artifact)
+            recordValuation(artifact.name, params)
+          }
+        }
+        "handoff" -> {
+          // Streaming-observer source: must be registered as a ScheduleObserver too, else it never
+          // gets callbacks and collect()s an empty signal.
+          if (feedbackSources.none { it is HandoffFeedbackSource }) {
+            // The handoff bucket keys on stackTraceHash (schedule-stable code location, not the
+            // unstable identityHashCode-based resource id), which is 0 unless resolution is forced on.
+            // Cost: every RacingOperation walks its stack (StackWalker, no caching).
+            RacingOperation.resolveRacingOperationStackTraceHash = true
+            val handoff = HandoffFeedbackSource(countHits = parseHits(params))
+            feedbackSources.add(handoff)
+            scheduleObservers.add(handoff)
+            testStatusObservers.add(handoff)
+            recordValuation(handoff.name, params)
+          }
+        }
+        "location" -> {
+          // Streaming-observer source like handoff. Reads stackTraceHash, 0 unless resolution is
+          // forced on; safe here since init{} runs before any iteration.
+          if (feedbackSources.none { it is CodeLocationFeedbackSource }) {
+            RacingOperation.resolveRacingOperationStackTraceHash = true
+            val location = CodeLocationFeedbackSource(countHits = parseHits(params))
+            feedbackSources.add(location)
+            scheduleObservers.add(location)
+            testStatusObservers.add(location)
+            recordValuation(location.name, params)
+          }
+        }
+        else -> {} // unknown kind: ignore, never fail the run
+      }
+    }
+  }
+
+  /**
+   * Record the novelty valuation for a just-registered source from its `weight`/`decay`/`k` params.
+   * No-op if none is present, so the source stays absent from [feedbackValuations] and uses
+   * [NoveltyValuation.IDENTITY]. Lenient -- a bad value falls back to its default, never fails the
+   * run. Once any knob is given the default curve is LOG; pass `decay=linear` to keep flat-linear.
+   */
+  private fun recordValuation(name: String, params: Map<String, String>) {
+    val hasKnob = params.keys.any { it == "weight" || it == "decay" || it == "k" }
+    if (!hasKnob) return
+    val weight = params["weight"]?.toDoubleOrNull()?.takeIf { it > 0.0 } ?: 1.0
+    val decay =
+        when (params["decay"]?.lowercase()) {
+          "linear" -> NoveltyValuation.Decay.LINEAR
+          "log" -> NoveltyValuation.Decay.LOG
+          "sqrt" -> NoveltyValuation.Decay.SQRT
+          "satexp" -> NoveltyValuation.Decay.SATEXP
+          null -> NoveltyValuation.Decay.LOG
+          else -> NoveltyValuation.Decay.LOG
+        }
+    val k = params["k"]?.toDoubleOrNull()?.takeIf { it > 0.0 } ?: NoveltyValuation.DEFAULT_K
+    feedbackValuations[name] = NoveltyValuation(weight = weight, decay = decay, k = k)
+  }
+
+  /**
+   * Parse the AFL-style hit-count flag. Defaults TRUE; only explicit `hits=false`/`0`/`no` opt out
+   * to set-membership, so a typo degrades toward the richer signal rather than failing the run.
+   */
+  private fun parseHits(params: Map<String, String>): Boolean =
+      when (params["hits"]?.lowercase()) {
+        "false",
+        "0",
+        "no" -> false
+        else -> true
+      }
 
   fun elapsedTime(): Long {
     return (TimeSource.Monotonic.markNow() - startTime).inWholeMilliseconds
@@ -585,7 +924,20 @@ data class Configuration(
 
   fun nextIteration() {
     currentIteration++
-    scheduler = scheduler.nextIteration(randomnessProvider.getRandomness())
+    scheduler = scheduler.nextIteration(randomnessProvider.getRandomness(), lastFeedback)
+    // Scheduler instance is replaced each iteration, so re-inject the stable observeState bridge.
+    injectObservedStateHolder()
+  }
+
+  /**
+   * Point a live [QLearningScheduler] at this run's [lastObservedState] holder. Configuration-side
+   * because it alone holds both the holder and the live scheduler. No-op for non-QL schedulers.
+   */
+  private fun injectObservedStateHolder() {
+    (scheduler as? QLearningScheduler)?.let {
+      it.observedStateHolder = lastObservedState
+      it.refreshAbstraction()
+    }
   }
 
   @OptIn(ExperimentalPathApi::class)

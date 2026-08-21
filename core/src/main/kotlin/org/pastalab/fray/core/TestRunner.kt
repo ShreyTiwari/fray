@@ -76,6 +76,9 @@ class TestRunner(val config: Configuration) {
               if (runResult == null) {
                 runResult = context.bugFound
               }
+              // Cache grey-box feedback at the iteration-end seam; nextIteration() hands it to
+              // the scheduler. No-op unless a feedback-driven scheduler registered sources.
+              config.collectFeedback(context.bugFound)
               context.shutDown()
             })
         t.start()
@@ -87,6 +90,7 @@ class TestRunner(val config: Configuration) {
       )
           break
       config.nextIteration()
+      config.beforeIterationFeedback()
     }
 
     val coverageInfo =
@@ -95,13 +99,27 @@ class TestRunner(val config: Configuration) {
         } else {
           ""
         }
+    val feedbackInfo =
+        config.feedbackAggregator?.let { agg ->
+          val perSource =
+              agg.featuresSeenBySource().entries.joinToString(", ") { "${it.key}=${it.value}" }
+          ", Distinct feedback features: ${agg.totalFeaturesSeen()}" +
+              if (perSource.isNotEmpty()) " (by source: $perSource)" else ""
+        } ?: ""
     config.frayLogger.info(
         "Run finished. Total iter: ${config.currentIteration}, " +
             "Elapsed time: ${config.elapsedTime()}ms, " +
             "Iterations/sec: %.2f".format(iterationsPerSecond(config.currentIteration)) +
-            coverageInfo,
+            coverageInfo +
+            feedbackInfo,
         true,
     )
+    config.feedbackAggregator?.let { agg ->
+      stdout.println("Distinct feedback features: ${agg.totalFeaturesSeen()}")
+      agg.featuresSeenBySource().forEach { (source, count) ->
+        stdout.println("  $source coverage (distinct features): $count")
+      }
+    }
     config.executionInfo.executor.afterExecution()
     return runResult
   }

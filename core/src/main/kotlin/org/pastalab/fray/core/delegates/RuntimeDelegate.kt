@@ -269,6 +269,25 @@ class RuntimeDelegate(val context: RunContext, val synchronizer: DelegateSynchro
     synchronizer.onSkipSchedulingDone(signature)
   }
 
+  override fun observeState(value: Long) {
+    // Side-channel only: never enters the scheduling path, so a reported value can't become a
+    // choice point or perturb the interleaving/replay.
+    if (synchronizer.entered.get()) return
+    context.config.observeState(value)
+  }
+
+  override fun observeState(key: String) = observeState(stableStateHash(key))
+
+  /** Stable 64-bit FNV-1a hash of string state keys; independent of String.hashCode(). */
+  private fun stableStateHash(key: String): Long {
+    var hash = -0x340d631b7bdddcdbL // FNV-1a offset basis
+    for (c in key) {
+      hash = hash xor c.code.toLong()
+      hash *= 0x100000001b3L // FNV-1a prime
+    }
+    return hash
+  }
+
   override fun onSkipPrimitive(signature: String) {
     synchronizer.onSkipPrimitive(signature)
   }

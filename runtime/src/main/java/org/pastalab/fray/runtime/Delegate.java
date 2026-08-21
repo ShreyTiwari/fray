@@ -104,6 +104,11 @@ public class Delegate {
 
   public void onSkipSchedulingDone(String signature) {}
 
+  // Value/state feedback side-channel.
+  public void observeState(long value) {}
+
+  public void observeState(String key) {}
+
   public void start() {}
 
   public void onThreadPark() {}

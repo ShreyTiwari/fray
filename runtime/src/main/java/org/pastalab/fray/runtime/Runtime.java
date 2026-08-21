@@ -201,6 +201,16 @@ public class Runtime {
     LOCK_DELEGATE.onSkipSchedulingDone(signature);
   }
 
+  // Pure side-channel into the feedback loop: never a choice point, so it does not perturb
+  // interleaving or replay. No-op unless a value-based feedback source is registered.
+  public static void observeState(long value) {
+    LOCK_DELEGATE.observeState(value);
+  }
+
+  public static void observeState(String key) {
+    LOCK_DELEGATE.observeState(key);
+  }
+
   public static void start() {
     LOCK_DELEGATE.start();
   }
